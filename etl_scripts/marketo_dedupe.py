@@ -15,7 +15,8 @@ from datetime import datetime
 from enum import Enum
 
 from etl_utilities.utils import send_teams_message
-from global_settings import bi_db, CONTACTS_LIMIT, DOWNLOADS_PATH, DRY_RUN, log, mc, SQLITE_DB_PATH
+from diagnostics import DiagnosticsManager
+from global_settings import DIAGNOSTICS_PATH, bi_db, CONTACTS_LIMIT, DOWNLOADS_PATH, DRY_RUN, log, mc, SQLITE_DB_PATH
 from mkto_data_downloader import download_jobs, enqueue_jobs, monitor_queued_jobs, populate_sqlite_table, submit_export_jobs
 from query_functions import (double_check_not_found_in_marketo, get_contact_type_categories, get_contact_type_category_id, get_dupes_from_dump, 
                              get_records_from_email_marketing_f, is_deleted_contact, show_EMF_record, soft_delete_contact)
@@ -33,10 +34,11 @@ class DupeRecField(Enum):
     ACTION = 6
 
 
-def create_directories():
+def create_directories(downloads_path=DOWNLOADS_PATH, sqlite_path=SQLITE_DB_PATH, diagnostics_path=DIAGNOSTICS_PATH):
     """ Create all the required directories """
-    os.makedirs(DOWNLOADS_PATH, exist_ok=True)
-    os.makedirs(SQLITE_DB_PATH, exist_ok=True)
+    os.makedirs(downloads_path, exist_ok=True)
+    os.makedirs(sqlite_path, exist_ok=True)
+    os.makedirs(diagnostics_path, exist_ok=True)
 
 def remove_files_in_dir(directory):
     """ Removes all the files in the specified directory"""
@@ -83,6 +85,7 @@ def call_marketo_API_merge_lead(
     retries: int = 3,
     base_delay: float = 10.0,
     backoff_factor: float = 2.0,
+    diagnostics: DiagnosticsManager = None,
 ):
     """
     Calls Marketo's 'merge_lead' API method with retry logic.
@@ -108,7 +111,10 @@ def call_marketo_API_merge_lead(
     attempt = 1
     while attempt <= retries:
         try:
-            result_merge_marketo = mc.execute(method='merge_lead', id=winner, leadIds=losers)
+            if diagnostics:
+                result_merge_marketo = diagnostics.execute_marketo(mc, method='merge_lead', export_id=None, id=winner, leadIds=losers)
+            else:
+                result_merge_marketo = mc.execute(method='merge_lead', id=winner, leadIds=losers)
             return result_merge_marketo 
         
         except Exception as exc:
@@ -131,7 +137,7 @@ def call_marketo_API_merge_lead(
 
         attempt += 1 
 
-def perform_dedupe(db_file_name, category_types, dupes_from_dump):
+def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: DiagnosticsManager = None):
     """ Execute dedupe procedure over every contactID in the contact_ids list """
 
     if DRY_RUN:
@@ -204,14 +210,14 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump):
         for dupe_rec in dupe_recs:
             log.debug(dupe_rec) 
         
-        if perform_dedupe_single_contact(contact_id, dupe_recs):
+        if perform_dedupe_single_contact(contact_id, dupe_recs, diagnostics=diagnostics):
             successful_merges += 1
         
         log.info(f"Completed: {counter / total_dupes * 100:.2f}%   ({counter}/{total_dupes})")
 
     sqlite_conn.close()
     
-def perform_dedupe_single_contact(contact_id, dupe_recs):
+def perform_dedupe_single_contact(contact_id, dupe_recs, diagnostics: DiagnosticsManager = None):
     """ Processes all the duplicate record on a given dupe_recs list """
 
     winner = None
@@ -239,7 +245,7 @@ def perform_dedupe_single_contact(contact_id, dupe_recs):
     
     result_merge_marketo = True
     if not DRY_RUN:
-        result_merge_marketo = call_marketo_API_merge_lead(winner, losers_marketo)
+        result_merge_marketo = call_marketo_API_merge_lead(winner, losers_marketo, diagnostics=diagnostics)
     
     if not result_merge_marketo:
         log.error("Merge in Marketo failed. Skipping contact...")
@@ -287,21 +293,38 @@ def determine_winner(dupe_recs, contact_id, category_types, actual_contact_type_
 
 def main():
     start_ts = time.time()
+    diagnostics = DiagnosticsManager(DIAGNOSTICS_PATH, log)
+    downloads_path = diagnostics.downloads_dir
+    sqlite_path = diagnostics.sqlite_dir
+    export_ids = []
     try: 
-        create_directories()
-        remove_files_in_dir(DOWNLOADS_PATH)
+        create_directories(downloads_path, sqlite_path, DIAGNOSTICS_PATH)
+        remove_files_in_dir(downloads_path)
+        log.info(f"Diagnostics artifacts will be written to: {diagnostics.root}")
 
-        export_ids = submit_export_jobs(mc, 2017, 1, datetime.now().year, datetime.now().month)  
-        enqueue_jobs(mc, export_ids)
+        diagnostics.mark_phase_start("create_jobs")
+        export_ids = submit_export_jobs(mc, 2017, 1, datetime.now().year, datetime.now().month, diagnostics=diagnostics)  
+        diagnostics.mark_phase_end("create_jobs")
+        diagnostics.mark_phase_start("enqueue_jobs")
+        enqueue_jobs(mc, export_ids, diagnostics=diagnostics)
+        diagnostics.mark_phase_end("enqueue_jobs")
         
-        if not monitor_queued_jobs(mc, export_ids):
+        diagnostics.mark_phase_start("monitor_jobs")
+        if not monitor_queued_jobs(mc, export_ids, diagnostics=diagnostics):
             raise Exception("Error downloading data from Marketo")
+        diagnostics.mark_phase_end("monitor_jobs")
         
-        download_jobs(mc, export_ids)
-        db_file_name = populate_sqlite_table(export_ids)
+        diagnostics.mark_phase_start("download_jobs")
+        download_jobs(mc, export_ids, diagnostics=diagnostics, download_dir=downloads_path)
+        diagnostics.mark_phase_end("download_jobs")
+        diagnostics.write_counts_summary()
+
+        diagnostics.mark_phase_start("sqlite_load")
+        db_file_name = populate_sqlite_table(export_ids, diagnostics=diagnostics, download_dir=downloads_path, sqlite_dir=sqlite_path)
+        diagnostics.mark_phase_end("sqlite_load")
         category_types = get_contact_type_categories()
         dupes_from_dump = get_dupes_from_dump(db_file_name)[0:CONTACTS_LIMIT]
-        perform_dedupe(db_file_name, category_types, dupes_from_dump)
+        perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics=diagnostics)
 
     except Exception as e:
         log.critical("Critical error has occurred. Error info: {e}".format(e=e))
@@ -315,6 +338,11 @@ def main():
         log.info("-" * 100)
         log.info (f"Contacts with duplicates found: {total_dupes}. Contacts successfully processed: {successful_merges}")
         log.info("-" * 100)
+        try:
+            diagnostics.write_run_summary(total_export_jobs=len(export_ids))
+            log.info(f"Run summary written to {diagnostics.paths['run_summary']}")
+        except Exception as diag_exc:
+            log.error(f"Failed to write run summary: {diag_exc}")
 
         log.info("Closing database connection...")
         bi_db.close()
