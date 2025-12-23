@@ -4,6 +4,7 @@ marketo_dedupe.py    Mar/2025    Jose Rosati
     Description : Remove duplicate record from Marketo
 """
 
+import argparse
 import glob
 import requests
 import os
@@ -291,12 +292,32 @@ def determine_winner(dupe_recs, contact_id, category_types, actual_contact_type_
               f" and submitted email: {dupe_recs[0][DupeRecField.EMAIL.value]}")
     return None
 
-def main():
+def _count_rows_in_sqlite(db_file_name: str) -> int:
+    sqlite_conn = sqlite3.connect(db_file_name)
+    cursor = sqlite_conn.cursor()
+    total_rows = cursor.execute("SELECT COUNT(*) FROM mkto_dump").fetchone()[0]
+    sqlite_conn.close()
+    return total_rows
+
+
+def _is_export_only_mode(args_export_only: bool) -> bool:
+    env_flag = os.getenv("EXPORT_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+    return args_export_only or env_flag
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Marketo export and dedupe pipeline")
+    parser.add_argument("--export-only", "--stop-after-load", action="store_true", help="Stop after SQLite load and skip dedupe/merge")
+    return parser.parse_args()
+
+
+def main(export_only: bool = False):
     start_ts = time.time()
     diagnostics = DiagnosticsManager(DIAGNOSTICS_PATH, log)
     downloads_path = diagnostics.downloads_dir
     sqlite_path = diagnostics.sqlite_dir
     export_ids = []
+    export_only_summary = None
     try: 
         create_directories(downloads_path, sqlite_path, DIAGNOSTICS_PATH)
         remove_files_in_dir(downloads_path)
@@ -322,6 +343,27 @@ def main():
         diagnostics.mark_phase_start("sqlite_load")
         db_file_name = populate_sqlite_table(export_ids, diagnostics=diagnostics, download_dir=downloads_path, sqlite_dir=sqlite_path)
         diagnostics.mark_phase_end("sqlite_load")
+        sqlite_row_count = _count_rows_in_sqlite(db_file_name)
+        log.info(f"Rows currently in mkto_dump: {sqlite_row_count}")
+
+        if export_only:
+            export_only_summary = {
+                "mode": "export_only",
+                "export_jobs_created": len(export_ids),
+                "export_jobs_enqueued": len(export_ids),
+                "export_jobs_completed": len(export_ids),
+                "csvs_downloaded": len(export_ids),
+                "rows_per_csv": {record.get("export_id"): record.get("row_count") for record in diagnostics.download_records},
+                "total_rows_across_csvs": sum(record.get("row_count", 0) for record in diagnostics.download_records),
+                "sqlite_db_path": db_file_name,
+                "sqlite_mkto_dump_rowcount": sqlite_row_count,
+            }
+            diagnostics.export_only_summary = export_only_summary
+            log.info("Export-only mode enabled. SQLite load complete; skipping dedupe/merge steps.")
+            log.info(f"SQLite DB: {db_file_name}")
+            log.info(f"mkto_dump rowcount: {sqlite_row_count}")
+            return 0
+
         category_types = get_contact_type_categories()
         dupes_from_dump = get_dupes_from_dump(db_file_name)[0:CONTACTS_LIMIT]
         perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics=diagnostics)
@@ -339,7 +381,7 @@ def main():
         log.info (f"Contacts with duplicates found: {total_dupes}. Contacts successfully processed: {successful_merges}")
         log.info("-" * 100)
         try:
-            diagnostics.write_run_summary(total_export_jobs=len(export_ids))
+            diagnostics.write_run_summary(total_export_jobs=len(export_ids), extra_summary=export_only_summary)
             log.info(f"Run summary written to {diagnostics.paths['run_summary']}")
         except Exception as diag_exc:
             log.error(f"Failed to write run summary: {diag_exc}")
@@ -354,4 +396,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    export_only_mode = _is_export_only_mode(args.export_only)
+    sys.exit(main(export_only=export_only_mode))

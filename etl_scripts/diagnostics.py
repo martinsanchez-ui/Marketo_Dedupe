@@ -364,7 +364,7 @@ class DiagnosticsManager:
                         }
                     )
 
-    def write_run_summary(self, total_export_jobs: int) -> None:
+    def write_run_summary(self, total_export_jobs: int, extra_summary: Optional[Dict[str, Any]] = None) -> None:
         summary = {
             "timestamp": _now_iso(),
             "run_id": self.run_id,
@@ -379,6 +379,9 @@ class DiagnosticsManager:
             "median_row_count": self.median_row_count,
             "low_row_threshold": self.low_row_threshold,
         }
+
+        if extra_summary:
+            summary["export_only"] = self.sanitize(extra_summary)
 
         with open(self.paths["run_summary"], "w", encoding="utf-8") as f:
             json.dump(self.sanitize(summary), f, ensure_ascii=False, indent=2)
