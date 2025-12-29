@@ -152,6 +152,73 @@ def _finalize_crm_metrics(metrics: Dict[str, object]) -> Dict[str, object]:
     return finalized
 
 
+def _initialize_run_stats() -> Dict[str, object]:
+    return {
+        "total_duplicate_groups_found": 0,
+        "groups_entered_stage5": 0,
+        "groups_winner_selected": 0,
+        "groups_skipped_no_winner": 0,
+        "groups_skipped_no_marketo_losers": 0,
+        "groups_merge_attempted": 0,
+        "groups_merge_succeeded": 0,
+        "groups_merge_failed": 0,
+        "groups_aborted_due_to_inconsistent_email": 0,
+        "groups_aborted_other_reasons": 0,
+        "groups_aborted_reasons": {},
+        "total_marketo_losers_attempted": 0,
+        "total_marketo_losers_merged": 0,
+        "inconsistent_email_event_count": 0,
+        "inconsistent_email_unique_marketo_ids": set(),
+        "inconsistent_email_groups": set(),
+        "unique_winner_marketo_ids": set(),
+        "unique_loser_marketo_ids": set(),
+        "unique_loser_crm_ids": set(),
+    }
+
+
+def _finalize_run_stats(stats: Dict[str, object]) -> Dict[str, object]:
+    finalized = dict(stats)
+    finalized["inconsistent_email_unique_marketo_ids"] = len(stats.get("inconsistent_email_unique_marketo_ids", set()))
+    finalized["inconsistent_email_groups"] = len(stats.get("inconsistent_email_groups", set()))
+    finalized["unique_winner_marketo_ids"] = len(stats.get("unique_winner_marketo_ids", set()))
+    finalized["unique_loser_marketo_ids"] = len(stats.get("unique_loser_marketo_ids", set()))
+    finalized["unique_loser_crm_ids"] = len(stats.get("unique_loser_crm_ids", set()))
+    finalized["dry_run"] = DRY_RUN
+    return finalized
+
+
+def _log_stats_summary(stats: Dict[str, object]) -> None:
+    log.info("=" * 60)
+    log.info("Stats Summary:")
+    ordered_keys = [
+        "dry_run",
+        "total_duplicate_groups_found",
+        "groups_entered_stage5",
+        "groups_winner_selected",
+        "groups_skipped_no_winner",
+        "groups_aborted_due_to_inconsistent_email",
+        "groups_skipped_no_marketo_losers",
+        "groups_merge_attempted",
+        "groups_merge_succeeded",
+        "groups_merge_failed",
+        "groups_aborted_other_reasons",
+        "total_marketo_losers_attempted",
+        "total_marketo_losers_merged",
+        "unique_winner_marketo_ids",
+        "unique_loser_marketo_ids",
+        "unique_loser_crm_ids",
+        "inconsistent_email_event_count",
+        "inconsistent_email_unique_marketo_ids",
+        "inconsistent_email_groups",
+    ]
+    for key in ordered_keys:
+        if key in stats:
+            log.info(f"  {key}: {stats[key]}")
+    if "groups_aborted_reasons" in stats:
+        log.info(f"  groups_aborted_reasons: {stats['groups_aborted_reasons']}")
+    log.info("=" * 60)
+
+
 def create_directories(downloads_path=DOWNLOADS_PATH, sqlite_path=SQLITE_DB_PATH, diagnostics_path=DIAGNOSTICS_PATH):
     """ Create all the required directories """
     os.makedirs(downloads_path, exist_ok=True)
@@ -256,7 +323,7 @@ def call_marketo_API_merge_lead(
         attempt += 1 
 
 def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: DiagnosticsManager = None,
-                  stage_metrics: Optional[Dict[str, object]] = None, stop_after_validation: bool = False):
+                  stage_metrics: Optional[Dict[str, object]] = None, stats: Optional[Dict[str, object]] = None, stop_after_validation: bool = False):
     """ Execute dedupe procedure over every contactID in the contact_ids list """
 
     if DRY_RUN:
@@ -280,7 +347,10 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: D
     for dupe_contact in dupes_from_dump: 
         counter += 1
         contact_id = dupe_contact[0]
+        dupe_email = dupe_contact[1] if len(dupe_contact) > 1 else ""
         abort_this_dupe = False
+        if stats is not None:
+            stats["groups_entered_stage5"] += 1
         log.info("-" * 100)
         if stop_after_validation:
             log.info(f"Instrumentation-only: CRM cross-check for contactId {contact_id} {dupe_contact[1]} (no merges will run)")
@@ -324,6 +394,10 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: D
                 else:
                     log.error(f"---> Inconsistent email address between Marketo and CRM in marketo_id {dupe_CRM[DupeRecField.MARKETO_ID.value]}. Requires human intervention.")
                     abort_this_dupe = True
+                    if stats is not None:
+                        stats["inconsistent_email_event_count"] += 1
+                        stats["inconsistent_email_unique_marketo_ids"].add(dupe_CRM[DupeRecField.MARKETO_ID.value])
+                        stats["inconsistent_email_groups"].add(contact_id)
                     if stage_metrics is not None:
                         if not inconsistent_email_case_recorded:
                             stage_metrics["inconsistent_email_cases"] += 1
@@ -347,6 +421,9 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: D
 
         if abort_this_dupe:
             # As part of the abort action, we'll show the data collected so far
+            if stats is not None:
+                stats["groups_aborted_due_to_inconsistent_email"] += 1
+                stats["groups_aborted_reasons"]["inconsistent_email"] = stats["groups_aborted_reasons"].get("inconsistent_email", 0) + 1
             for dupe_rec in dupe_recs:
                 log.debug(dupe_rec) 
             continue
@@ -367,24 +444,52 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: D
         
         if not winner_marketo_id:
             log.error("Unable to determine a winner. Skipping...")
+            if stats is not None:
+                stats["groups_skipped_no_winner"] += 1
+                stats["groups_aborted_other_reasons"] += 1
+                stats["groups_aborted_reasons"]["no_winner"] = stats["groups_aborted_reasons"].get("no_winner", 0) + 1
             continue
+        if stats is not None:
+            stats["groups_winner_selected"] += 1
+            stats["unique_winner_marketo_ids"].add(winner_marketo_id)
 
         for dupe_rec in dupe_recs:
             if dupe_rec[DupeRecField.MARKETO_ID.value] == winner_marketo_id:
                 dupe_rec[DupeRecField.ACTION.value] = "Winner"
 
+        winner_source = next(
+            (dupe_rec[DupeRecField.SOURCE.value] for dupe_rec in dupe_recs if dupe_rec[DupeRecField.MARKETO_ID.value] == winner_marketo_id),
+            "Unknown",
+        )
+        losers_marketo_preview = [
+            dupe_rec[DupeRecField.MARKETO_ID.value]
+            for dupe_rec in dupe_recs
+            if dupe_rec[DupeRecField.SOURCE.value] in {"Marketo", "Both"} and dupe_rec[DupeRecField.ACTION.value] != "Winner"
+        ]
+        losers_crm_preview = [
+            dupe_rec[DupeRecField.MARKETO_ID.value]
+            for dupe_rec in dupe_recs
+            if dupe_rec[DupeRecField.SOURCE.value] in {"CRM", "Both"} and dupe_rec[DupeRecField.ACTION.value] != "Winner"
+        ]
+        log.info(
+            f"[Stage5] contact_id={contact_id} email={dupe_email} winner={winner_marketo_id} "
+            f"winner_source={winner_source} losers_marketo_count={len(losers_marketo_preview)} "
+            f"losers_crm_count={len(losers_crm_preview)}"
+        )
+
         # logging the list for debugging purposes
         for dupe_rec in dupe_recs:
             log.debug(dupe_rec) 
         
-        if perform_dedupe_single_contact(contact_id, dupe_recs, diagnostics=diagnostics):
+        merge_result = perform_dedupe_single_contact(contact_id, dupe_recs, diagnostics=diagnostics, stats=stats)
+        if merge_result and not DRY_RUN:
             successful_merges += 1
         
         log.info(f"Completed: {counter / total_dupes * 100:.2f}%   ({counter}/{total_dupes})")
 
     sqlite_conn.close()
     
-def perform_dedupe_single_contact(contact_id, dupe_recs, diagnostics: DiagnosticsManager = None):
+def perform_dedupe_single_contact(contact_id, dupe_recs, diagnostics: DiagnosticsManager = None, stats: Optional[Dict[str, object]] = None):
     """ Processes all the duplicate record on a given dupe_recs list """
 
     winner = None
@@ -406,25 +511,51 @@ def perform_dedupe_single_contact(contact_id, dupe_recs, diagnostics: Diagnostic
             losers_CRM.append(dupe_rec[DupeRecField.MARKETO_ID.value])
 
     log.debug (f"[perform_dedupe_single_contact] winner = {winner} losers in Marketo = {losers_marketo}, losers in CRM = {losers_CRM}")
+    if stats is not None:
+        stats["unique_loser_marketo_ids"].update(losers_marketo)
+        stats["unique_loser_crm_ids"].update(losers_CRM)
+    log.info(f"[Stage6.1] contact_id={contact_id} winner={winner} losers_marketo_count={len(losers_marketo)} losers_crm_count={len(losers_CRM)}")
+    if not losers_marketo:
+        log.info("[Stage6.1] No Marketo losers to merge; skipping merge step.")
+        if stats is not None:
+            stats["groups_skipped_no_marketo_losers"] += 1
+            stats["groups_aborted_other_reasons"] += 1
+            stats["groups_aborted_reasons"]["no_marketo_losers"] = stats["groups_aborted_reasons"].get("no_marketo_losers", 0) + 1
+        return False
     
     # Call Marketo API to merge contacts. API returns boolean. True means successful.
     log.debug(f"Calling Marketo API: method='merge_lead', id={winner}, leadIds={losers_marketo}")
     
     result_merge_marketo = True
+    if stats is not None:
+        stats["groups_merge_attempted"] += 1
+        stats["total_marketo_losers_attempted"] += len(losers_marketo)
     if not DRY_RUN:
-        result_merge_marketo = call_marketo_API_merge_lead(winner, losers_marketo, diagnostics=diagnostics)
+        try:
+            result_merge_marketo = call_marketo_API_merge_lead(winner, losers_marketo, diagnostics=diagnostics)
+        except Exception as exc:
+            log.error(f"Merge in Marketo raised an error: {exc}")
+            if stats is not None:
+                stats["groups_merge_failed"] += 1
+                stats["groups_aborted_other_reasons"] += 1
+                stats["groups_aborted_reasons"]["merge_failed_exception"] = stats["groups_aborted_reasons"].get("merge_failed_exception", 0) + 1
+            return False
     
     if not result_merge_marketo:
         log.error("Merge in Marketo failed. Skipping contact...")
+        if stats is not None:
+            stats["groups_merge_failed"] += 1
+            stats["groups_aborted_other_reasons"] += 1
+            stats["groups_aborted_reasons"]["merge_failed"] = stats["groups_aborted_reasons"].get("merge_failed", 0) + 1
         return False
 
-    log.info(f"{'DRY RUN:' if DRY_RUN else ''} Contact successfully merged in Marketo")
-
-    # Perform Merge in email_marketing_f
-    for loser_CRM in losers_CRM:
-        log.debug(f"Calling soft_delete_contact contact_id={contact_id}, loser_CRM={loser_CRM}, dry_run={DRY_RUN}")
-        soft_delete_contact(contact_id, loser_CRM, DRY_RUN)
-        show_EMF_record(contact_id, loser_CRM)
+    if DRY_RUN:
+        log.info("DRY RUN: Contact merge simulated in Marketo (no changes performed).")
+    else:
+        log.info("Contact successfully merged in Marketo")
+        if stats is not None:
+            stats["groups_merge_succeeded"] += 1
+            stats["total_marketo_losers_merged"] += len(losers_marketo)
 
     if DRY_RUN:
         log.info("DRY RUN mode. No changes performed.")
@@ -481,6 +612,7 @@ def main(export_only: bool = False):
     start_ts = time.time()
     diagnostics = DiagnosticsManager(DIAGNOSTICS_PATH, log)
     stage_counts = StageCounts(diagnostics.root, logger=log, run_id=diagnostics.run_id)
+    run_stats = _initialize_run_stats()
     downloads_path = diagnostics.downloads_dir
     sqlite_path = diagnostics.sqlite_dir
     export_ids = []
@@ -548,6 +680,7 @@ def main(export_only: bool = False):
         duplicate_metrics = _gather_duplicate_metrics(db_file_name, dupes_from_dump)
         log.info(f"Stage DUPLICATE_IDENTIFICATION metrics: {duplicate_metrics}")
         stage_counts.add("DUPLICATE_IDENTIFICATION", duplicate_metrics)
+        run_stats["total_duplicate_groups_found"] = duplicate_metrics.get("duplicate_group_count", 0)
 
         log.info("Stage CRM_CROSS_CHECK: starting CRM cross-check instrumentation.")
         perform_dedupe(
@@ -582,9 +715,19 @@ def main(export_only: bool = False):
         }
         stage_counts.add("CRM_MARKETO_ID_MISSING_VALIDATION", validation_metrics)
         log.info(f"Stage CRM_MARKETO_ID_MISSING_VALIDATION metrics: {validation_metrics}")
-        log.info("Forcing hard stop immediately after CRM MarketoID missing validation stage.")
-        stage_counts.write()
-        raise SystemExit("INTENTIONAL_STOP_AFTER_STAGE_5")
+        log.info("Stage DEDUPE_AND_MERGE: executing Stage 5 winner selection + Stage 6.1 Marketo merges only.")
+        perform_dedupe(
+            db_file_name,
+            category_types,
+            dupes_from_dump,
+            diagnostics=diagnostics,
+            stats=run_stats,
+            stop_after_validation=False,
+        )
+        final_stats = _finalize_run_stats(run_stats)
+        _log_stats_summary(final_stats)
+        stage_counts.add("DEDUPLICATION_AND_STAGE6_1", final_stats)
+        return 0
 
     except SystemExit:
         raise
