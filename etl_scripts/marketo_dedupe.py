@@ -13,9 +13,9 @@ import sqlite3
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from etl_utilities.utils import send_teams_message
 from diagnostics import DiagnosticsManager
@@ -40,6 +40,39 @@ class DupeRecField(Enum):
 
 def _now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+def _now_iso_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+CRM_NO_MATCH_FIELDS = [
+    "run_id",
+    "captured_at_utc",
+    "contact_id",
+    "group_email",
+    "group_key",
+    "mkto_rows_in_group",
+    "mkto_marketo_ids_in_group",
+    "mkto_fullnames_sample",
+    "note",
+]
+
+INCONSISTENT_EMAIL_FIELDS = [
+    "run_id",
+    "captured_at_utc",
+    "contact_id",
+    "group_email",
+    "crm_marketo_id",
+    "crm_email",
+    "reason_code",
+    "mkto_emails_for_that_marketo_id",
+    "mkto_rows_for_that_marketo_id",
+    "mkto_marketo_ids_in_group",
+    "explanation",
+]
+
+_crm_no_match_logged_keys: Set[str] = set()
+_inconsistent_email_logged_keys: Set[str] = set()
 
 
 def _gather_csv_stage_metrics(downloads_path: str) -> Dict[str, object]:
@@ -124,6 +157,105 @@ def _gather_duplicate_metrics(db_file_name: str, dupes_from_dump: tuple) -> Dict
         "duplicate_unique_contact_ids": unique_contact_ids,
         "captured_at": _now_iso(),
     }
+
+
+def _append_diagnostic_csv(diagnostics: Optional[DiagnosticsManager], filename: str, fieldnames: List[str], row: Dict[str, object]) -> None:
+    if diagnostics is None:
+        return
+    try:
+        diagnostics.append_csv_row(filename, fieldnames, row)
+    except Exception as exc:
+        log.error(f"Failed to append diagnostic row to {filename}: {exc}")
+
+
+def _record_crm_no_match_group(
+    diagnostics: Optional[DiagnosticsManager],
+    contact_id: str,
+    group_email: str,
+    dupe_recs: List[List[object]],
+) -> None:
+    if diagnostics is None:
+        return
+    group_email = group_email or ""
+    group_key = f"{contact_id}|{group_email}"
+    if group_key in _crm_no_match_logged_keys:
+        return
+    _crm_no_match_logged_keys.add(group_key)
+
+    marketo_ids_in_group = sorted({str(rec[DupeRecField.MARKETO_ID.value]) for rec in dupe_recs if rec[DupeRecField.MARKETO_ID.value] is not None})
+    fullname_sample = []
+    for rec in dupe_recs:
+        name_value = rec[DupeRecField.NAME.value]
+        if name_value and name_value not in fullname_sample:
+            fullname_sample.append(name_value)
+        if len(fullname_sample) >= 3:
+            break
+
+    row = {
+        "run_id": diagnostics.run_id,
+        "captured_at_utc": _now_iso_utc(),
+        "contact_id": contact_id,
+        "group_email": group_email,
+        "group_key": group_key,
+        "mkto_rows_in_group": len(dupe_recs),
+        "mkto_marketo_ids_in_group": "|".join(marketo_ids_in_group),
+        "mkto_fullnames_sample": "|".join(fullname_sample),
+        "note": "No CRM rows found for this (contact_id,email)",
+    }
+    _append_diagnostic_csv(diagnostics, "crm_no_match_groups.csv", CRM_NO_MATCH_FIELDS, row)
+
+
+def _fetch_marketo_email_evidence(sqlite_conn: sqlite3.Connection, marketo_id: str) -> Tuple[List[str], int]:
+    emails: List[str] = []
+    row_count = 0
+    try:
+        cursor = sqlite_conn.cursor()
+        cursor.execute("SELECT DISTINCT Email FROM mkto_dump WHERE Id = ?", (marketo_id,))
+        emails = [row[0] for row in cursor.fetchall() if row and row[0]]
+        row_count = cursor.execute("SELECT COUNT(*) FROM mkto_dump WHERE Id = ?", (marketo_id,)).fetchone()[0]
+    except Exception as exc:
+        log.error(f"Failed to collect mkto_dump evidence for marketo_id {marketo_id}: {exc}")
+    return sorted(set(emails)), row_count
+
+
+def _record_inconsistent_email_case(
+    diagnostics: Optional[DiagnosticsManager],
+    sqlite_conn: sqlite3.Connection,
+    contact_id: str,
+    group_email: str,
+    dupe_CRM: List[object],
+    group_marketo_ids: List[object],
+) -> None:
+    if diagnostics is None:
+        return
+    group_email = group_email or ""
+    crm_marketo_id = dupe_CRM[DupeRecField.MARKETO_ID.value]
+    unique_key = f"{contact_id}|{group_email}|{crm_marketo_id}"
+    if unique_key in _inconsistent_email_logged_keys:
+        return
+    _inconsistent_email_logged_keys.add(unique_key)
+
+    mkto_emails, mkto_row_count = _fetch_marketo_email_evidence(sqlite_conn, crm_marketo_id)
+    marketo_ids_in_group = sorted({str(mid) for mid in group_marketo_ids if mid is not None})
+    explanation = (
+        f"Marketo ID {crm_marketo_id} exists in mkto_dump under email(s) {', '.join(mkto_emails) or 'N/A'}, "
+        f"which does not match group email '{group_email}'."
+    )
+
+    row = {
+        "run_id": diagnostics.run_id,
+        "captured_at_utc": _now_iso_utc(),
+        "contact_id": contact_id,
+        "group_email": group_email,
+        "crm_marketo_id": crm_marketo_id,
+        "crm_email": dupe_CRM[DupeRecField.EMAIL.value],
+        "reason_code": "PRESENT_IN_EXPORT_DIFFERENT_EMAIL",
+        "mkto_emails_for_that_marketo_id": "|".join(mkto_emails),
+        "mkto_rows_for_that_marketo_id": mkto_row_count,
+        "mkto_marketo_ids_in_group": "|".join(marketo_ids_in_group),
+        "explanation": explanation,
+    }
+    _append_diagnostic_csv(diagnostics, "inconsistent_email_cases.csv", INCONSISTENT_EMAIL_FIELDS, row)
 
 
 def _initialize_crm_metrics() -> Dict[str, object]:
@@ -369,6 +501,13 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: D
             stage_metrics["unique_marketo_ids_from_crm"].update(
                 [dupe_CRM[DupeRecField.MARKETO_ID.value] for dupe_CRM in dupes_CRM if len(dupe_CRM) > DupeRecField.MARKETO_ID.value]
             )
+        if not dupes_CRM:
+            _record_crm_no_match_group(
+                diagnostics,
+                contact_id=str(contact_id),
+                group_email=dupe_email,
+                dupe_recs=dupe_recs,
+            )
         missing_marketo_ids: List[str] = []
         inconsistent_email_case_recorded = False
  
@@ -393,6 +532,14 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: D
                     missing_marketo_ids.append(dupe_CRM[DupeRecField.MARKETO_ID.value])
                 else:
                     log.error(f"---> Inconsistent email address between Marketo and CRM in marketo_id {dupe_CRM[DupeRecField.MARKETO_ID.value]}. Requires human intervention.")
+                    _record_inconsistent_email_case(
+                        diagnostics,
+                        sqlite_conn,
+                        contact_id=str(contact_id),
+                        group_email=dupe_email,
+                        dupe_CRM=dupe_CRM,
+                        group_marketo_ids=dupe_recs_marketo_id_only,
+                    )
                     abort_this_dupe = True
                     if stats is not None:
                         stats["inconsistent_email_event_count"] += 1

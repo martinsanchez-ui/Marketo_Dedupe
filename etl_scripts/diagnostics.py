@@ -65,6 +65,25 @@ class DiagnosticsManager:
     def sqlite_dir(self) -> str:
         return self.paths["sqlite"]
 
+    def path_in_run(self, relative_path: str) -> str:
+        """Resolve a path relative to the current diagnostics run root."""
+        return os.path.join(self.root, relative_path)
+
+    def append_csv_row(self, relative_path: str, fieldnames: List[str], row: Dict[str, Any]) -> str:
+        """
+        Append a row to a CSV under the diagnostics run directory, writing the header if the file
+        does not yet exist. Returns the absolute file path for reference.
+        """
+        file_path = self.path_in_run(relative_path)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        file_exists = os.path.exists(file_path)
+        with open(file_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists or os.path.getsize(file_path) == 0:
+                writer.writeheader()
+            writer.writerow(row)
+        return file_path
+
     def _ensure_directories(self) -> None:
         os.makedirs(self.root, exist_ok=True)
         os.makedirs(self.paths["api_responses"], exist_ok=True)
