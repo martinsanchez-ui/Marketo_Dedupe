@@ -7,6 +7,7 @@ marketo_dedupe.py    Mar/2025    Jose Rosati
 import argparse
 import csv
 import glob
+import json
 import requests
 import os
 import sqlite3
@@ -69,6 +70,23 @@ INCONSISTENT_EMAIL_FIELDS = [
     "mkto_rows_for_that_marketo_id",
     "mkto_marketo_ids_in_group",
     "explanation",
+]
+
+UNABLE_TO_DETERMINE_WINNER_FIELDS = [
+    "run_id",
+    "timestamp_utc",
+    "contact_id",
+    "group_email",
+    "group_key",
+    "marketo_rows_in_group_count",
+    "marketo_ids_in_group",
+    "crm_rows_found_count",
+    "crm_marketo_ids",
+    "actual_contact_type_category_id",
+    "actual_contact_type_category_name",
+    "reason",
+    "decision_trace",
+    "candidate_records",
 ]
 
 _crm_no_match_logged_keys: Set[str] = set()
@@ -256,6 +274,81 @@ def _record_inconsistent_email_case(
         "explanation": explanation,
     }
     _append_diagnostic_csv(diagnostics, "inconsistent_email_cases.csv", INCONSISTENT_EMAIL_FIELDS, row)
+
+
+def _record_unable_to_determine_winner_case(
+    diagnostics: Optional[DiagnosticsManager],
+    contact_id: str,
+    group_email: str,
+    dupe_recs: List[List[object]],
+    crm_rows: List[object],
+    category_types: Dict[object, object],
+    actual_contact_type_category_id,
+    reason: str,
+) -> None:
+    if diagnostics is None:
+        return
+    group_email = group_email or ""
+    group_key = f"{contact_id}|{group_email}"
+    marketo_rows = [rec for rec in dupe_recs if rec[DupeRecField.SOURCE.value] in {"Marketo", "Both"}]
+    marketo_ids_in_group = sorted(
+        {
+            str(rec[DupeRecField.MARKETO_ID.value])
+            for rec in marketo_rows
+            if rec[DupeRecField.MARKETO_ID.value] is not None
+        }
+    )
+    crm_marketo_ids = sorted(
+        {str(rec[DupeRecField.MARKETO_ID.value]) for rec in crm_rows if len(rec) > DupeRecField.MARKETO_ID.value}
+    )
+    candidate_records = [
+        {
+            "marketo_id": rec[DupeRecField.MARKETO_ID.value],
+            "contact_id": rec[DupeRecField.CONTACT_ID.value],
+            "full_name": rec[DupeRecField.NAME.value],
+            "email": rec[DupeRecField.EMAIL.value],
+            "contact_type_category": rec[DupeRecField.CONTACT_TYPE_CATEGORY.value],
+            "source": rec[DupeRecField.SOURCE.value],
+            "action": rec[DupeRecField.ACTION.value],
+        }
+        for rec in dupe_recs
+    ]
+    records_with_both_source = [rec for rec in dupe_recs if rec[DupeRecField.SOURCE.value] == "Both"]
+    records_matching_category = [
+        rec
+        for rec in records_with_both_source
+        if rec[DupeRecField.CONTACT_TYPE_CATEGORY.value] == category_types.get(actual_contact_type_category_id)
+    ]
+    decision_trace = json.dumps(
+        {
+            "has_both_source": bool(records_with_both_source),
+            "both_source_count": len(records_with_both_source),
+            "matching_contact_type_count": len(records_matching_category),
+            "winner_candidates": [rec[DupeRecField.MARKETO_ID.value] for rec in records_matching_category],
+        }
+    )
+    row = {
+        "run_id": diagnostics.run_id,
+        "timestamp_utc": _now_iso_utc(),
+        "contact_id": contact_id,
+        "group_email": group_email,
+        "group_key": group_key,
+        "marketo_rows_in_group_count": len(marketo_rows),
+        "marketo_ids_in_group": "|".join(marketo_ids_in_group),
+        "crm_rows_found_count": len(crm_rows),
+        "crm_marketo_ids": "|".join(crm_marketo_ids),
+        "actual_contact_type_category_id": actual_contact_type_category_id,
+        "actual_contact_type_category_name": category_types.get(actual_contact_type_category_id),
+        "reason": reason,
+        "decision_trace": decision_trace,
+        "candidate_records": json.dumps(candidate_records),
+    }
+    _append_diagnostic_csv(
+        diagnostics,
+        "unable_to_determine_winner_cases.csv",
+        UNABLE_TO_DETERMINE_WINNER_FIELDS,
+        row,
+    )
 
 
 def _initialize_crm_metrics() -> Dict[str, object]:
@@ -455,7 +548,8 @@ def call_marketo_API_merge_lead(
         attempt += 1 
 
 def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: DiagnosticsManager = None,
-                  stage_metrics: Optional[Dict[str, object]] = None, stats: Optional[Dict[str, object]] = None, stop_after_validation: bool = False):
+                  stage_metrics: Optional[Dict[str, object]] = None, stats: Optional[Dict[str, object]] = None, stop_after_validation: bool = False,
+                  stop_before_merge: bool = False):
     """ Execute dedupe procedure over every contactID in the contact_ids list """
 
     if DRY_RUN:
@@ -591,6 +685,18 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: D
         
         if not winner_marketo_id:
             log.error("Unable to determine a winner. Skipping...")
+            _record_unable_to_determine_winner_case(
+                diagnostics=diagnostics,
+                contact_id=str(contact_id),
+                group_email=dupe_email,
+                dupe_recs=dupe_recs,
+                crm_rows=dupes_CRM,
+                category_types=category_types,
+                actual_contact_type_category_id=actual_contact_type_category_id,
+                reason="no_both_records_matching_actual_contact_type"
+                if any(rec[DupeRecField.SOURCE.value] == "Both" for rec in dupe_recs)
+                else "no_records_with_source_both",
+            )
             if stats is not None:
                 stats["groups_skipped_no_winner"] += 1
                 stats["groups_aborted_other_reasons"] += 1
@@ -627,7 +733,14 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: D
         # logging the list for debugging purposes
         for dupe_rec in dupe_recs:
             log.debug(dupe_rec) 
-        
+
+        if stop_before_merge:
+            log.info("Stop-before-merge flag enabled; skipping merge operations for this contact.")
+            if stats is not None:
+                stats["groups_aborted_other_reasons"] += 1
+                stats["groups_aborted_reasons"]["stop_before_merge"] = stats["groups_aborted_reasons"].get("stop_before_merge", 0) + 1
+            continue
+
         merge_result = perform_dedupe_single_contact(contact_id, dupe_recs, diagnostics=diagnostics, stats=stats)
         if merge_result and not DRY_RUN:
             successful_merges += 1
@@ -748,14 +861,23 @@ def _is_export_only_mode(args_export_only: bool) -> bool:
     env_flag = os.getenv("EXPORT_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
     return args_export_only or env_flag
 
+def _is_stop_before_merge_mode(args_stop_before_merge: bool) -> bool:
+    env_flag = os.getenv("STOP_BEFORE_MERGE", "").strip().lower() in {"1", "true", "yes", "on"}
+    return args_stop_before_merge or env_flag
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Marketo export and dedupe pipeline")
     parser.add_argument("--export-only", "--stop-after-load", action="store_true", help="Stop after SQLite load and skip dedupe/merge")
+    parser.add_argument(
+        "--stop-before-merge",
+        action="store_true",
+        help="Run through winner selection and diagnostics only; skip all merge/update operations.",
+    )
     return parser.parse_args()
 
 
-def main(export_only: bool = False):
+def main(export_only: bool = False, stop_before_merge: bool = False):
     start_ts = time.time()
     diagnostics = DiagnosticsManager(DIAGNOSTICS_PATH, log)
     stage_counts = StageCounts(diagnostics.root, logger=log, run_id=diagnostics.run_id)
@@ -870,10 +992,14 @@ def main(export_only: bool = False):
             diagnostics=diagnostics,
             stats=run_stats,
             stop_after_validation=False,
+            stop_before_merge=stop_before_merge,
         )
         final_stats = _finalize_run_stats(run_stats)
         _log_stats_summary(final_stats)
         stage_counts.add("DEDUPLICATION_AND_STAGE6_1", final_stats)
+        if stop_before_merge:
+            log.info("Stop-before-merge mode requested; exiting before any merge/cleanup operations.")
+            raise SystemExit("INTENTIONAL_STOP_BEFORE_MERGE")
         return 0
 
     except SystemExit:
@@ -913,4 +1039,5 @@ def main(export_only: bool = False):
 if __name__ == "__main__":
     args = parse_args()
     export_only_mode = _is_export_only_mode(args.export_only)
-    sys.exit(main(export_only=export_only_mode))
+    stop_before_merge_mode = _is_stop_before_merge_mode(args.stop_before_merge)
+    sys.exit(main(export_only=export_only_mode, stop_before_merge=stop_before_merge_mode))
