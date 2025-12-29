@@ -131,16 +131,23 @@ def _initialize_crm_metrics() -> Dict[str, object]:
         "groups_checked_in_crm": 0,
         "groups_with_crm_match": 0,
         "crm_rows_matched": 0,
+        "crm_records_carried_forward": 0,
         "unique_marketo_ids_from_crm": set(),
         "missing_marketo_id_validation_checked": 0,
         "missing_marketo_id_cases": 0,
         "missing_marketo_ids_total": 0,
+        "missing_marketo_id_examples": [],
+        "inconsistent_email_cases": 0,
+        "inconsistent_email_marketo_ids_total": 0,
+        "inconsistent_email_examples": [],
     }
 
 
 def _finalize_crm_metrics(metrics: Dict[str, object]) -> Dict[str, object]:
     finalized = dict(metrics)
     finalized["unique_marketo_ids_from_crm"] = sorted(list(metrics.get("unique_marketo_ids_from_crm", set())))
+    finalized["missing_marketo_id_examples"] = metrics.get("missing_marketo_id_examples", [])[:25]
+    finalized["inconsistent_email_examples"] = metrics.get("inconsistent_email_examples", [])[:25]
     finalized["captured_at"] = _now_iso()
     return finalized
 
@@ -275,7 +282,10 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: D
         contact_id = dupe_contact[0]
         abort_this_dupe = False
         log.info("-" * 100)
-        log.info(f"Deduping contactId: {contact_id} {dupe_contact[1]}")
+        if stop_after_validation:
+            log.info(f"Instrumentation-only: CRM cross-check for contactId {contact_id} {dupe_contact[1]} (no merges will run)")
+        else:
+            log.info(f"Deduping contactId: {contact_id} {dupe_contact[1]}")
 
         # Build dupe lists
         dupe_recs = [[*x, "Marketo", ""] for x in cursor.execute(GET_MKTO_DUMP_RECORDS_QUERY % dupe_contact).fetchall()]
@@ -290,19 +300,44 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: D
                 [dupe_CRM[DupeRecField.MARKETO_ID.value] for dupe_CRM in dupes_CRM if len(dupe_CRM) > DupeRecField.MARKETO_ID.value]
             )
         missing_marketo_ids: List[str] = []
+        inconsistent_email_case_recorded = False
  
         for dupe_CRM in dupes_CRM:
             idx = dupe_recs_marketo_id_only.index(dupe_CRM[0]) if dupe_CRM[0] in dupe_recs_marketo_id_only else None
             if idx is not None: 
                 dupe_recs[idx][DupeRecField.SOURCE.value] = "Both"
             else:
-                missing_marketo_ids.append(dupe_CRM[DupeRecField.MARKETO_ID.value])
                 # Double check that the appended marketo_id absolutely don't have any record in Marketo. (In case there are mixed email addresses)
                 if double_check_not_found_in_marketo(sqlite_conn, dupe_CRM[DupeRecField.MARKETO_ID.value]): 
                     dupe_recs.append([*dupe_CRM, "CRM", ""])
+                    if stage_metrics is not None:
+                        stage_metrics["crm_records_carried_forward"] += 1
+                        if len(stage_metrics["missing_marketo_id_examples"]) < 25:
+                            stage_metrics["missing_marketo_id_examples"].append(
+                                {
+                                    "contact_id": contact_id,
+                                    "email": dupe_CRM[DupeRecField.EMAIL.value],
+                                    "marketo_id": dupe_CRM[DupeRecField.MARKETO_ID.value],
+                                }
+                            )
+                    missing_marketo_ids.append(dupe_CRM[DupeRecField.MARKETO_ID.value])
                 else:
                     log.error(f"---> Inconsistent email address between Marketo and CRM in marketo_id {dupe_CRM[DupeRecField.MARKETO_ID.value]}. Requires human intervention.")
                     abort_this_dupe = True
+                    if stage_metrics is not None:
+                        if not inconsistent_email_case_recorded:
+                            stage_metrics["inconsistent_email_cases"] += 1
+                            inconsistent_email_case_recorded = True
+                        stage_metrics["inconsistent_email_marketo_ids_total"] += 1
+                        if len(stage_metrics["inconsistent_email_examples"]) < 25:
+                            stage_metrics["inconsistent_email_examples"].append(
+                                {
+                                    "contact_id": contact_id,
+                                    "email": dupe_contact[1],
+                                    "marketo_id": dupe_CRM[DupeRecField.MARKETO_ID.value],
+                                    "found_in_dump_with_different_email": True,
+                                }
+                            )
 
         if stage_metrics is not None:
             stage_metrics["missing_marketo_id_validation_checked"] += 1
@@ -506,7 +541,9 @@ def main(export_only: bool = False):
             return 0
 
         category_types = get_contact_type_categories()
-        dupes_from_dump = get_dupes_from_dump(db_file_name)[0:CONTACTS_LIMIT]
+        dupes_from_dump = get_dupes_from_dump(db_file_name)
+        if CONTACTS_LIMIT is not None:
+            dupes_from_dump = dupes_from_dump[0:CONTACTS_LIMIT]
         log.info("Stage DUPLICATE_IDENTIFICATION: recording duplicate metrics.")
         duplicate_metrics = _gather_duplicate_metrics(db_file_name, dupes_from_dump)
         log.info(f"Stage DUPLICATE_IDENTIFICATION metrics: {duplicate_metrics}")
@@ -526,6 +563,7 @@ def main(export_only: bool = False):
             "groups_checked_in_crm": finalized_crm_metrics.get("groups_checked_in_crm"),
             "groups_with_crm_match": finalized_crm_metrics.get("groups_with_crm_match"),
             "crm_rows_matched": finalized_crm_metrics.get("crm_rows_matched"),
+            "crm_records_carried_forward": finalized_crm_metrics.get("crm_records_carried_forward"),
             "unique_marketo_ids_from_crm": finalized_crm_metrics.get("unique_marketo_ids_from_crm"),
             "captured_at": finalized_crm_metrics.get("captured_at"),
         }
@@ -536,14 +574,20 @@ def main(export_only: bool = False):
             "missing_marketo_id_validation_checked": finalized_crm_metrics.get("missing_marketo_id_validation_checked"),
             "missing_marketo_id_cases": finalized_crm_metrics.get("missing_marketo_id_cases"),
             "missing_marketo_ids_total": finalized_crm_metrics.get("missing_marketo_ids_total"),
+            "missing_marketo_id_examples": finalized_crm_metrics.get("missing_marketo_id_examples"),
+            "inconsistent_email_cases": finalized_crm_metrics.get("inconsistent_email_cases"),
+            "inconsistent_email_marketo_ids_total": finalized_crm_metrics.get("inconsistent_email_marketo_ids_total"),
+            "inconsistent_email_examples": finalized_crm_metrics.get("inconsistent_email_examples"),
             "captured_at": finalized_crm_metrics.get("captured_at"),
         }
         stage_counts.add("CRM_MARKETO_ID_MISSING_VALIDATION", validation_metrics)
         log.info(f"Stage CRM_MARKETO_ID_MISSING_VALIDATION metrics: {validation_metrics}")
         log.info("Forcing hard stop immediately after CRM MarketoID missing validation stage.")
         stage_counts.write()
-        1/0
+        raise SystemExit("INTENTIONAL_STOP_AFTER_STAGE_5")
 
+    except SystemExit:
+        raise
     except Exception as e:
         log.critical("Critical error has occurred. Error info: {e}".format(e=e))
         log.error(traceback.print_exc())
