@@ -5,6 +5,7 @@ marketo_dedupe.py    Mar/2025    Jose Rosati
 """
 
 import argparse
+import csv
 import glob
 import requests
 import os
@@ -14,6 +15,7 @@ import time
 import traceback
 from datetime import datetime
 from enum import Enum
+from typing import Dict, List, Optional, Set
 
 from etl_utilities.utils import send_teams_message
 from diagnostics import DiagnosticsManager
@@ -21,6 +23,7 @@ from global_settings import DIAGNOSTICS_PATH, bi_db, CONTACTS_LIMIT, DOWNLOADS_P
 from mkto_data_downloader import download_jobs, enqueue_jobs, monitor_queued_jobs, populate_sqlite_table, submit_export_jobs
 from query_functions import (double_check_not_found_in_marketo, get_contact_type_categories, get_contact_type_category_id, get_dupes_from_dump, 
                              get_records_from_email_marketing_f, is_deleted_contact, show_EMF_record, soft_delete_contact)
+from stage_counts import StageCounts
 
 total_dupes = 0
 successful_merges = 0
@@ -33,6 +36,113 @@ class DupeRecField(Enum):
     CONTACT_TYPE_CATEGORY = 4
     SOURCE = 5
     ACTION = 6
+
+
+def _now_iso() -> str:
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _gather_csv_stage_metrics(downloads_path: str) -> Dict[str, object]:
+    csv_files = [
+        os.path.join(downloads_path, f)
+        for f in os.listdir(downloads_path)
+        if f.lower().endswith(".csv") and os.path.isfile(os.path.join(downloads_path, f))
+    ]
+    rows_per_file: Dict[str, int] = {}
+    empty_or_tiny_files: List[str] = []
+    total_bytes = 0
+    tiny_threshold = 1
+
+    for csv_path in sorted(csv_files):
+        file_name = os.path.basename(csv_path)
+        total_bytes += os.path.getsize(csv_path)
+        row_count = 0
+        try:
+            with open(csv_path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.reader(f)
+                next(reader, None)
+                for _ in reader:
+                    row_count += 1
+        except Exception as exc:
+            log.error(f"Failed to read CSV for counting ({csv_path}): {exc}")
+        rows_per_file[file_name] = row_count
+        if row_count <= tiny_threshold:
+            empty_or_tiny_files.append(file_name)
+
+    csv_total_rows = sum(rows_per_file.values())
+    csv_file_count = len(rows_per_file)
+    metrics = {
+        "csv_file_count": csv_file_count,
+        "csv_total_rows": csv_total_rows,
+        "csv_rows_per_file": rows_per_file,
+        "empty_or_tiny_files": empty_or_tiny_files,
+        "total_bytes": total_bytes,
+        "created_at": _now_iso(),
+    }
+    return metrics
+
+
+def _gather_sqlite_stage_metrics(db_file_name: str) -> Dict[str, object]:
+    sqlite_conn = sqlite3.connect(db_file_name)
+    cursor = sqlite_conn.cursor()
+    mkto_dump_row_count = cursor.execute("SELECT COUNT(*) FROM mkto_dump").fetchone()[0]
+    unique_contact_ids = cursor.execute("SELECT COUNT(DISTINCT ContactID) FROM mkto_dump").fetchone()[0]
+    unique_contact_email_pairs = cursor.execute("SELECT COUNT(DISTINCT ContactID || '|' || Email) FROM mkto_dump").fetchone()[0]
+    null_or_blank_emails = cursor.execute(
+        "SELECT COUNT(*) FROM mkto_dump WHERE Email IS NULL OR TRIM(Email) = '' OR LOWER(Email) = 'null';"
+    ).fetchone()[0]
+    sqlite_conn.close()
+    return {
+        "mkto_dump_row_count": mkto_dump_row_count,
+        "unique_contact_ids": unique_contact_ids,
+        "unique_contact_email_pairs": unique_contact_email_pairs,
+        "null_or_blank_emails": null_or_blank_emails,
+        "captured_at": _now_iso(),
+    }
+
+
+def _gather_duplicate_metrics(db_file_name: str, dupes_from_dump: tuple) -> Dict[str, object]:
+    sqlite_conn = sqlite3.connect(db_file_name)
+    cursor = sqlite_conn.cursor()
+    duplicate_row_count = cursor.execute(
+        """
+        SELECT SUM(dupe_count)
+        FROM (
+            SELECT COUNT(*) as dupe_count
+            FROM mkto_dump
+            GROUP BY ContactID, FullName, Email
+            HAVING COUNT(*) > 1
+        );
+        """
+    ).fetchone()[0]
+    sqlite_conn.close()
+    duplicate_row_count = duplicate_row_count or 0
+    unique_contact_ids = len({dupe[0] for dupe in dupes_from_dump})
+    return {
+        "duplicate_group_count": len(dupes_from_dump),
+        "duplicate_row_count": duplicate_row_count,
+        "duplicate_unique_contact_ids": unique_contact_ids,
+        "captured_at": _now_iso(),
+    }
+
+
+def _initialize_crm_metrics() -> Dict[str, object]:
+    return {
+        "groups_checked_in_crm": 0,
+        "groups_with_crm_match": 0,
+        "crm_rows_matched": 0,
+        "unique_marketo_ids_from_crm": set(),
+        "missing_marketo_id_validation_checked": 0,
+        "missing_marketo_id_cases": 0,
+        "missing_marketo_ids_total": 0,
+    }
+
+
+def _finalize_crm_metrics(metrics: Dict[str, object]) -> Dict[str, object]:
+    finalized = dict(metrics)
+    finalized["unique_marketo_ids_from_crm"] = sorted(list(metrics.get("unique_marketo_ids_from_crm", set())))
+    finalized["captured_at"] = _now_iso()
+    return finalized
 
 
 def create_directories(downloads_path=DOWNLOADS_PATH, sqlite_path=SQLITE_DB_PATH, diagnostics_path=DIAGNOSTICS_PATH):
@@ -138,7 +248,8 @@ def call_marketo_API_merge_lead(
 
         attempt += 1 
 
-def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: DiagnosticsManager = None):
+def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: DiagnosticsManager = None,
+                  stage_metrics: Optional[Dict[str, object]] = None, stop_after_validation: bool = False):
     """ Execute dedupe procedure over every contactID in the contact_ids list """
 
     if DRY_RUN:
@@ -170,12 +281,22 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: D
         dupe_recs = [[*x, "Marketo", ""] for x in cursor.execute(GET_MKTO_DUMP_RECORDS_QUERY % dupe_contact).fetchall()]
         dupe_recs_marketo_id_only = [x[0] for x in dupe_recs]
         dupes_CRM = get_records_from_email_marketing_f(*dupe_contact)
+        if stage_metrics is not None:
+            stage_metrics["groups_checked_in_crm"] += 1
+            stage_metrics["crm_rows_matched"] += len(dupes_CRM)
+            if dupes_CRM:
+                stage_metrics["groups_with_crm_match"] += 1
+            stage_metrics["unique_marketo_ids_from_crm"].update(
+                [dupe_CRM[DupeRecField.MARKETO_ID.value] for dupe_CRM in dupes_CRM if len(dupe_CRM) > DupeRecField.MARKETO_ID.value]
+            )
+        missing_marketo_ids: List[str] = []
  
         for dupe_CRM in dupes_CRM:
             idx = dupe_recs_marketo_id_only.index(dupe_CRM[0]) if dupe_CRM[0] in dupe_recs_marketo_id_only else None
             if idx is not None: 
                 dupe_recs[idx][DupeRecField.SOURCE.value] = "Both"
             else:
+                missing_marketo_ids.append(dupe_CRM[DupeRecField.MARKETO_ID.value])
                 # Double check that the appended marketo_id absolutely don't have any record in Marketo. (In case there are mixed email addresses)
                 if double_check_not_found_in_marketo(sqlite_conn, dupe_CRM[DupeRecField.MARKETO_ID.value]): 
                     dupe_recs.append([*dupe_CRM, "CRM", ""])
@@ -183,10 +304,20 @@ def perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics: D
                     log.error(f"---> Inconsistent email address between Marketo and CRM in marketo_id {dupe_CRM[DupeRecField.MARKETO_ID.value]}. Requires human intervention.")
                     abort_this_dupe = True
 
+        if stage_metrics is not None:
+            stage_metrics["missing_marketo_id_validation_checked"] += 1
+            if missing_marketo_ids:
+                stage_metrics["missing_marketo_id_cases"] += 1
+                stage_metrics["missing_marketo_ids_total"] += len([mid for mid in missing_marketo_ids if mid is not None])
+
         if abort_this_dupe:
             # As part of the abort action, we'll show the data collected so far
             for dupe_rec in dupe_recs:
                 log.debug(dupe_rec) 
+            continue
+        
+        if stop_after_validation:
+            log.info("Stop after validation flag enabled; skipping merge operations for this contact.")
             continue
         
         # Step 0: Determine if the contact is deleted. For now this is only informative
@@ -314,10 +445,12 @@ def parse_args():
 def main(export_only: bool = False):
     start_ts = time.time()
     diagnostics = DiagnosticsManager(DIAGNOSTICS_PATH, log)
+    stage_counts = StageCounts(diagnostics.root, logger=log, run_id=diagnostics.run_id)
     downloads_path = diagnostics.downloads_dir
     sqlite_path = diagnostics.sqlite_dir
     export_ids = []
     export_only_summary = None
+    crm_stage_metrics = _initialize_crm_metrics()
     try: 
         create_directories(downloads_path, sqlite_path, DIAGNOSTICS_PATH)
         remove_files_in_dir(downloads_path)
@@ -339,12 +472,20 @@ def main(export_only: bool = False):
         download_jobs(mc, export_ids, diagnostics=diagnostics, download_dir=downloads_path)
         diagnostics.mark_phase_end("download_jobs")
         diagnostics.write_counts_summary()
+        log.info("Stage CSV_DOWNLOADS: computing counts for downloaded CSV files.")
+        csv_metrics = _gather_csv_stage_metrics(downloads_path)
+        log.info(f"Stage CSV_DOWNLOADS metrics: {csv_metrics}")
+        stage_counts.add("CSV_DOWNLOADS", csv_metrics)
 
         diagnostics.mark_phase_start("sqlite_load")
         db_file_name = populate_sqlite_table(export_ids, diagnostics=diagnostics, download_dir=downloads_path, sqlite_dir=sqlite_path)
         diagnostics.mark_phase_end("sqlite_load")
         sqlite_row_count = _count_rows_in_sqlite(db_file_name)
         log.info(f"Rows currently in mkto_dump: {sqlite_row_count}")
+        log.info("Stage SQLITE_LOAD: capturing row counts from SQLite.")
+        sqlite_metrics = _gather_sqlite_stage_metrics(db_file_name)
+        log.info(f"Stage SQLITE_LOAD metrics: {sqlite_metrics}")
+        stage_counts.add("SQLITE_LOAD", sqlite_metrics)
 
         if export_only:
             export_only_summary = {
@@ -366,7 +507,42 @@ def main(export_only: bool = False):
 
         category_types = get_contact_type_categories()
         dupes_from_dump = get_dupes_from_dump(db_file_name)[0:CONTACTS_LIMIT]
-        perform_dedupe(db_file_name, category_types, dupes_from_dump, diagnostics=diagnostics)
+        log.info("Stage DUPLICATE_IDENTIFICATION: recording duplicate metrics.")
+        duplicate_metrics = _gather_duplicate_metrics(db_file_name, dupes_from_dump)
+        log.info(f"Stage DUPLICATE_IDENTIFICATION metrics: {duplicate_metrics}")
+        stage_counts.add("DUPLICATE_IDENTIFICATION", duplicate_metrics)
+
+        log.info("Stage CRM_CROSS_CHECK: starting CRM cross-check instrumentation.")
+        perform_dedupe(
+            db_file_name,
+            category_types,
+            dupes_from_dump,
+            diagnostics=diagnostics,
+            stage_metrics=crm_stage_metrics,
+            stop_after_validation=True,
+        )
+        finalized_crm_metrics = _finalize_crm_metrics(crm_stage_metrics)
+        crm_cross_check_metrics = {
+            "groups_checked_in_crm": finalized_crm_metrics.get("groups_checked_in_crm"),
+            "groups_with_crm_match": finalized_crm_metrics.get("groups_with_crm_match"),
+            "crm_rows_matched": finalized_crm_metrics.get("crm_rows_matched"),
+            "unique_marketo_ids_from_crm": finalized_crm_metrics.get("unique_marketo_ids_from_crm"),
+            "captured_at": finalized_crm_metrics.get("captured_at"),
+        }
+        stage_counts.add("CRM_CROSS_CHECK", crm_cross_check_metrics)
+        log.info(f"Stage CRM_CROSS_CHECK metrics: {crm_cross_check_metrics}")
+
+        validation_metrics = {
+            "missing_marketo_id_validation_checked": finalized_crm_metrics.get("missing_marketo_id_validation_checked"),
+            "missing_marketo_id_cases": finalized_crm_metrics.get("missing_marketo_id_cases"),
+            "missing_marketo_ids_total": finalized_crm_metrics.get("missing_marketo_ids_total"),
+            "captured_at": finalized_crm_metrics.get("captured_at"),
+        }
+        stage_counts.add("CRM_MARKETO_ID_MISSING_VALIDATION", validation_metrics)
+        log.info(f"Stage CRM_MARKETO_ID_MISSING_VALIDATION metrics: {validation_metrics}")
+        log.info("Forcing hard stop immediately after CRM MarketoID missing validation stage.")
+        stage_counts.write()
+        1/0
 
     except Exception as e:
         log.critical("Critical error has occurred. Error info: {e}".format(e=e))
@@ -385,6 +561,11 @@ def main(export_only: bool = False):
             log.info(f"Run summary written to {diagnostics.paths['run_summary']}")
         except Exception as diag_exc:
             log.error(f"Failed to write run summary: {diag_exc}")
+        try:
+            stage_counts.write()
+            log.info(f"Stage counts written to {stage_counts.json_path}")
+        except Exception as stage_exc:
+            log.error(f"Failed to write stage counts: {stage_exc}")
 
         log.info("Closing database connection...")
         bi_db.close()
