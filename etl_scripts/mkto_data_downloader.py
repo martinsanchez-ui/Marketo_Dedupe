@@ -10,7 +10,8 @@ import os
 import time
 import sqlite3
 
-from global_settings import DOWNLOADS_PATH, log, SQLITE_DB_PATH
+from global_settings import (DOWNLOADS_PATH, SQLITE_DB_PATH, extract_marketo_error_info,
+                             log, safe_json_dump)
 
 
 def produce_start_end_dates(year, month):
@@ -41,7 +42,7 @@ def create_dates_for_data_chunks(start_year, start_month, end_year, end_month):
     return dates_list
 
 
-def submit_export_jobs(mc, start_year, start_month, end_year, end_month, dry_run=False):
+def submit_export_jobs(mc, start_year, start_month, end_year, end_month, dry_run=False, run_id=None):
     """ Creates the chunks from the supplied start and end dates and submit the job creation to Marketo """
 
     FIELDS = ["Id", "ContactID", "FullName", "Email", "ContactTypeCategory"]
@@ -49,10 +50,12 @@ def submit_export_jobs(mc, start_year, start_month, end_year, end_month, dry_run
     
     # obtain the list of chunks
     chunk_dates = create_dates_for_data_chunks(start_year, start_month, end_year, end_month)
-    log.info(f"Dates requested: {start_year}/{start_month} to {end_year}/{end_month}")
-    log.debug(f"List of chunks: {chunk_dates}")
+    log.info(f"[MKTO_DEDUPE] run_id={run_id} step=submit_export_jobs action=start start_year={start_year} "
+             f"start_month={start_month} end_year={end_year} end_month={end_month} total_chunks={len(chunk_dates)} "
+             f"fields={FIELDS}")
+    log.debug(f"[MKTO_DEDUPE] run_id={run_id} step=submit_export_jobs action=chunk_list chunks={safe_json_dump(chunk_dates)}")
 
-    for chunk_date in chunk_dates:
+    for idx, chunk_date in enumerate(chunk_dates, start=1):
         filters = {
             "createdAt": {
                 "startAt": chunk_date[0],
@@ -60,26 +63,54 @@ def submit_export_jobs(mc, start_year, start_month, end_year, end_month, dry_run
             }
         }
 
-        log.debug(filters)
+        log.info(f"[MKTO_DEDUPE] run_id={run_id} step=create_export_job action=request idx={idx} total={len(chunk_dates)} "
+                 f"start_at={chunk_date[0]} end_at={chunk_date[1]} filters={safe_json_dump(filters)}")
 
         if not dry_run:
-            export_job = mc.execute(method="create_leads_export_job", fields=FIELDS, filters=filters)
-
-            export_id = export_job[0]["exportId"]
-            log.info(f"Export ID for chunk {chunk_date}: {export_id}")
-            export_ids.append(export_id)
+            try:
+                export_job = mc.execute(method="create_leads_export_job", fields=FIELDS, filters=filters)
+                export_id = export_job[0]["exportId"]
+                log.info(f"[MKTO_DEDUPE] run_id={run_id} step=create_export_job action=success idx={idx} total={len(chunk_dates)} "
+                         f"export_id={export_id} start_at={chunk_date[0]} end_at={chunk_date[1]}")
+                log.debug(f"[MKTO_DEDUPE] run_id={run_id} step=create_export_job action=response export_id={export_id} "
+                          f"response={safe_json_dump(export_job)}")
+                export_ids.append(export_id)
+            except Exception as exc:
+                code, message, payload = extract_marketo_error_info(exc)
+                log.error(f"[MKTO_DEDUPE] run_id={run_id} step=create_export_job action=error idx={idx} total={len(chunk_dates)} "
+                          f"start_at={chunk_date[0]} end_at={chunk_date[1]} exc_repr={repr(exc)} exc_str={str(exc)} "
+                          f"exc_args={safe_json_dump(getattr(exc, 'args', None))} response={safe_json_dump(payload)}")
+                if code or message:
+                    log.error(f"[MKTO_DEDUPE] run_id={run_id} step=create_export_job MKTO_ERROR parsed_code={code} "
+                              f"parsed_message={message}")
+                raise
     
+    log.info(f"[MKTO_DEDUPE] run_id={run_id} step=submit_export_jobs action=complete export_ids_count={len(export_ids)}")
     return export_ids
     
 
-def enqueue_jobs(mc, export_ids):
+def enqueue_jobs(mc, export_ids, run_id=None):
     """ Enqueue the jobs recently created """
     
-    for export_id in export_ids:
-        log.info(f"Enqueuing job: {export_id}")
-        mc.execute(method='enqueue_leads_export_job', job_id=export_id)
+    total = len(export_ids)
+    log.info(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=start total={total}")
+    for idx, export_id in enumerate(export_ids, start=1):
+        log.info(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=request idx={idx} total={total} export_id={export_id}")
+        try:
+            response = mc.execute(method='enqueue_leads_export_job', job_id=export_id)
+            log.info(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=success idx={idx} total={total} export_id={export_id}")
+            log.debug(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=response export_id={export_id} "
+                      f"response={safe_json_dump(response)}")
+        except Exception as exc:
+            code, message, payload = extract_marketo_error_info(exc)
+            log.error(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=error idx={idx} total={total} export_id={export_id} "
+                      f"exc_repr={repr(exc)} exc_str={str(exc)} exc_args={safe_json_dump(getattr(exc, 'args', None))} "
+                      f"response={safe_json_dump(payload)}")
+            if code or message:
+                log.error(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue MKTO_ERROR parsed_code={code} parsed_message={message}")
+            raise
 
-def monitor_queued_jobs(mc, export_ids):
+def monitor_queued_jobs(mc, export_ids, run_id=None):
     """ Monitors the list of queued jobs and waits until all the of them are ready to be downloaded """
     
     COMPLETED = "Completed"
@@ -88,6 +119,8 @@ def monitor_queued_jobs(mc, export_ids):
     checks_remaining = 180 # 180 checks every 10 seconds each is 30 minutes
     export_ids_status = {k:"" for k in export_ids}
     
+    total = len(export_ids)
+    log.info(f"[MKTO_DEDUPE] run_id={run_id} step=monitor action=start total={total} checks_remaining={checks_remaining}")
     while checks_remaining and list(export_ids_status.values()) != ALL_COMPLETED_LIST:
         checks_remaining -= 1
 
@@ -96,32 +129,50 @@ def monitor_queued_jobs(mc, export_ids):
                 continue
 
             job_status = mc.execute(method='get_leads_export_job_status', job_id=export_id)[0]['status']
-            log.info(f"Export Job {export_id} Status: {job_status}")
+            log.info(f"[MKTO_DEDUPE] run_id={run_id} step=monitor action=status export_id={export_id} status={job_status} "
+                     f"checks_remaining={checks_remaining}")
 
             if job_status == COMPLETED:
                 export_ids_status[export_id] = COMPLETED
 
         if list(export_ids_status.values()) != ALL_COMPLETED_LIST:
-            log.info("Waiting for 10 seconds...")
+            log.info(f"[MKTO_DEDUPE] run_id={run_id} step=monitor action=wait seconds=10 checks_remaining={checks_remaining}")
             time.sleep(10)  
 
     if list(export_ids_status.values()) != ALL_COMPLETED_LIST:
-        log.error("Marketo couldn't export all the chunks on time. Aborting.")
+        incomplete = [k for k, v in export_ids_status.items() if v != COMPLETED]
+        log.error(f"[MKTO_DEDUPE] run_id={run_id} step=monitor action=timeout total={total} "
+                  f"incomplete_count={len(incomplete)} incomplete_export_ids={safe_json_dump(incomplete)}")
         return False
 
+    log.info(f"[MKTO_DEDUPE] run_id={run_id} step=monitor action=complete total={total}")
     return True
 
     
-def download_jobs(mc, export_ids):
+def download_jobs(mc, export_ids, run_id=None):
     """ Downloads the jobs from Marketo """
 
-    for export_id in export_ids:
+    total = len(export_ids)
+    log.info(f"[MKTO_DEDUPE] run_id={run_id} step=download action=start total={total}")
+    for idx, export_id in enumerate(export_ids, start=1):
         file_name = os.path.join(DOWNLOADS_PATH, f"{export_id}.csv")
-        log.info(f"Downloading file: {file_name}")
-        file_content = mc.execute(method="get_leads_export_job_file", job_id=export_id)
+        log.info(f"[MKTO_DEDUPE] run_id={run_id} step=download action=request idx={idx} total={total} "
+                 f"export_id={export_id} file={file_name}")
+        try:
+            file_content = mc.execute(method="get_leads_export_job_file", job_id=export_id)
+        except Exception as exc:
+            code, message, payload = extract_marketo_error_info(exc)
+            log.error(f"[MKTO_DEDUPE] run_id={run_id} step=download action=error idx={idx} total={total} export_id={export_id} "
+                      f"file={file_name} exc_repr={repr(exc)} exc_str={str(exc)} exc_args={safe_json_dump(getattr(exc, 'args', None))} "
+                      f"response={safe_json_dump(payload)}")
+            if code or message:
+                log.error(f"[MKTO_DEDUPE] run_id={run_id} step=download MKTO_ERROR parsed_code={code} parsed_message={message}")
+            raise
                 
         with open(file_name, "wb") as f:
             f.write(file_content)
+        log.info(f"[MKTO_DEDUPE] run_id={run_id} step=download action=success idx={idx} total={total} export_id={export_id} "
+                 f"bytes={len(file_content)} file={file_name}")
 
     
 def populate_sqlite_table(export_ids):
