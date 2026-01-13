@@ -154,31 +154,80 @@ def submit_export_jobs(mc, start_year, start_month, end_year, end_month, dry_run
     return export_ids
     
 
-def enqueue_jobs(mc, export_ids, run_id=None):
+def enqueue_jobs(mc, export_ids, run_id=None, max_in_flight=8, poll_seconds=10):
     """ Enqueue the jobs recently created """
-    
-    total = len(export_ids)
-    log.info(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=start total={total}")
-    for idx, export_id in enumerate(export_ids, start=1):
-        log.info(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=request idx={idx} total={total} export_id={export_id}")
-        try:
-            response = mc.execute(method='enqueue_leads_export_job', job_id=export_id)
-            log.info(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=success idx={idx} total={total} export_id={export_id}")
-            log.debug(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=response export_id={export_id} "
-                      f"response={safe_json_dump(response)}")
-        except Exception as exc:
-            code, message, payload = extract_marketo_error_info(exc)
-            log.error(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=error idx={idx} total={total} export_id={export_id} "
-                      f"exc_repr={repr(exc)} exc_str={str(exc)} exc_args={safe_json_dump(getattr(exc, 'args', None))} "
-                      f"response={safe_json_dump(payload)}")
+
+    ACTIVE_STATUSES = {"Queued", "Processing", "Created"}
+    FINISHED_STATUSES = {"Completed", "Failed", "Cancelled"}
+
+    def _is_queue_full_error(exc, code, message):
+        if code == 1029:
+            return True
+        if message and "Too many jobs" in message:
+            return True
+        exc_str = str(exc)
+        return "Too many jobs" in exc_str or "1029" in exc_str
+
+    def _refresh_in_flight_statuses(in_flight_ids):
+        remaining = set(in_flight_ids)
+        for job_id in list(in_flight_ids):
             try:
-                _log_enqueue_raw_response(export_id, idx, total, run_id)
-            except Exception as diag_exc:
-                log.error(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=raw_response_failed idx={idx} total={total} "
-                          f"export_id={export_id} exc_repr={repr(diag_exc)}")
-            if code or message:
-                log.error(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue MKTO_ERROR parsed_code={code} parsed_message={message}")
-            raise
+                job_status = mc.execute(method='get_leads_export_job_status', job_id=job_id)[0]['status']
+            except Exception as exc:
+                log.error(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=status_error export_id={job_id} "
+                          f"exc_repr={repr(exc)} exc_str={str(exc)} exc_args={safe_json_dump(getattr(exc, 'args', None))}")
+                continue
+            if job_status in FINISHED_STATUSES:
+                remaining.discard(job_id)
+            elif job_status not in ACTIVE_STATUSES:
+                remaining.add(job_id)
+        return remaining
+
+    total = len(export_ids)
+    log.info(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=start total={total} max_in_flight={max_in_flight}")
+    in_flight = set()
+    idx = 0
+    while idx < total:
+        if len(in_flight) >= max_in_flight:
+            in_flight = _refresh_in_flight_statuses(in_flight)
+            if len(in_flight) >= max_in_flight:
+                log.info(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=wait reason=in_flight_full "
+                         f"in_flight={len(in_flight)} max_in_flight={max_in_flight} seconds={poll_seconds}")
+                time.sleep(poll_seconds)
+                continue
+
+        export_id = export_ids[idx]
+        idx += 1
+        log.info(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=request idx={idx} total={total} export_id={export_id}")
+        while True:
+            try:
+                response = mc.execute(method='enqueue_leads_export_job', job_id=export_id)
+                in_flight.add(export_id)
+                log.info(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=success idx={idx} total={total} "
+                         f"export_id={export_id} in_flight={len(in_flight)}")
+                log.debug(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=response export_id={export_id} "
+                          f"response={safe_json_dump(response)}")
+                break
+            except Exception as exc:
+                code, message, payload = extract_marketo_error_info(exc)
+                if _is_queue_full_error(exc, code, message):
+                    log.info(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=wait reason=queue_full "
+                             f"in_flight={len(in_flight)} max_in_flight={max_in_flight} seconds={poll_seconds}")
+                    time.sleep(poll_seconds)
+                    in_flight = _refresh_in_flight_statuses(in_flight)
+                    continue
+                log.error(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=error idx={idx} total={total} "
+                          f"export_id={export_id} exc_repr={repr(exc)} exc_str={str(exc)} "
+                          f"exc_args={safe_json_dump(getattr(exc, 'args', None))} response={safe_json_dump(payload)}")
+                try:
+                    _log_enqueue_raw_response(export_id, idx, total, run_id)
+                except Exception as diag_exc:
+                    log.error(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=raw_response_failed idx={idx} "
+                              f"total={total} export_id={export_id} exc_repr={repr(diag_exc)}")
+                if code or message:
+                    log.error(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue MKTO_ERROR parsed_code={code} "
+                              f"parsed_message={message}")
+                raise
 
 def monitor_queued_jobs(mc, export_ids, run_id=None):
     """ Monitors the list of queued jobs and waits until all the of them are ready to be downloaded """
