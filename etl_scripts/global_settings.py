@@ -17,7 +17,6 @@ SCRIPT_PATH = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADS_PATH = os.path.join(SCRIPT_PATH, "downloads")
 SQLITE_DB_PATH = os.path.join(SCRIPT_PATH, "sqlite_dbs")
 LOG_LOCATION = os.path.join(SCRIPT_PATH, "logs", "log.log")
-DIAGNOSTICS_PATH = os.path.join(SCRIPT_PATH, "diagnostics")
 
 SECRETS = load_secrets(ENV_FILE_PATH,
                        ["bi_hostname", "bi_username", "bi_password", "bi_database",
