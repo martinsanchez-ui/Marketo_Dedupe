@@ -6,12 +6,77 @@ mkto_data_downloader.py    Mar/2025    Jose Rosati
 
 import calendar
 import csv
+import json
 import os
+import requests
 import time
 import sqlite3
 
-from global_settings import (DOWNLOADS_PATH, SQLITE_DB_PATH, extract_marketo_error_info,
-                             log, safe_json_dump)
+from global_settings import (DOWNLOADS_PATH, SECRETS, SQLITE_DB_PATH,
+                             extract_marketo_error_info, log, safe_json_dump)
+
+
+RAW_RESPONSE_MAX_CHARS = 3000
+REQUEST_TIMEOUT_SECONDS = 30
+
+
+def _truncate_value(value, limit=RAW_RESPONSE_MAX_CHARS):
+    if value is None:
+        return value
+    value = str(value)
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated>"
+
+
+def _get_marketo_access_token():
+    munchkin = SECRETS.get("marketo_munchkin_id")
+    client_id = SECRETS.get("marketo_client_id")
+    client_secret = SECRETS.get("marketo_client_secret")
+
+    if not munchkin or not client_id or not client_secret:
+        raise ValueError("Missing Marketo credentials for access token request.")
+
+    token_url = f"https://{munchkin}.mktorest.com/identity/oauth/token"
+    params = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    response = requests.get(token_url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    payload = response.json()
+    return payload.get("access_token")
+
+
+def _log_enqueue_raw_response(export_id, idx, total, run_id=None):
+    munchkin = SECRETS.get("marketo_munchkin_id")
+    if not munchkin:
+        raise ValueError("Missing Marketo munchkin id for enqueue diagnostics.")
+
+    access_token = _get_marketo_access_token()
+    if not access_token:
+        raise ValueError("No access token returned from Marketo.")
+
+    url = f"https://{munchkin}.mktorest.com/bulk/v1/leads/export/{export_id}/enqueue.json"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = requests.post(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    http_status = response.status_code
+
+    raw_json = None
+    raw_text = None
+    try:
+        payload = response.json()
+        raw_json = _truncate_value(json.dumps(payload, ensure_ascii=False, default=str))
+    except ValueError:
+        raw_text = _truncate_value(response.text)
+
+    log_line = (f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=raw_response idx={idx} total={total} "
+                f"export_id={export_id} http_status={http_status}")
+    if raw_json is not None:
+        log.error(f"{log_line} raw_json={raw_json}")
+    else:
+        log.error(f"{log_line} raw_text={raw_text}")
 
 
 def produce_start_end_dates(year, month):
@@ -106,6 +171,11 @@ def enqueue_jobs(mc, export_ids, run_id=None):
             log.error(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=error idx={idx} total={total} export_id={export_id} "
                       f"exc_repr={repr(exc)} exc_str={str(exc)} exc_args={safe_json_dump(getattr(exc, 'args', None))} "
                       f"response={safe_json_dump(payload)}")
+            try:
+                _log_enqueue_raw_response(export_id, idx, total, run_id)
+            except Exception as diag_exc:
+                log.error(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=raw_response_failed idx={idx} total={total} "
+                          f"export_id={export_id} exc_repr={repr(diag_exc)}")
             if code or message:
                 log.error(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue MKTO_ERROR parsed_code={code} parsed_message={message}")
             raise
