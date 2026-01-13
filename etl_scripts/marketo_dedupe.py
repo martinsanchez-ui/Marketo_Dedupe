@@ -15,7 +15,8 @@ from datetime import datetime
 from enum import Enum
 
 from etl_utilities.utils import send_teams_message
-from global_settings import bi_db, CONTACTS_LIMIT, DOWNLOADS_PATH, DRY_RUN, log, mc, SQLITE_DB_PATH
+from global_settings import (CONTACTS_LIMIT, DOWNLOADS_PATH, DRY_RUN, SQLITE_DB_PATH,
+                             bi_db, generate_run_id, log, mc)
 from mkto_data_downloader import download_jobs, enqueue_jobs, monitor_queued_jobs, populate_sqlite_table, submit_export_jobs
 from query_functions import (double_check_not_found_in_marketo, get_contact_type_categories, get_contact_type_category_id, get_dupes_from_dump, 
                              get_records_from_email_marketing_f, is_deleted_contact, show_EMF_record, soft_delete_contact)
@@ -288,23 +289,33 @@ def determine_winner(dupe_recs, contact_id, category_types, actual_contact_type_
 def main():
     start_ts = time.time()
     try: 
+        run_id = generate_run_id()
+        log.info(f"[MKTO_DEDUPE] run_id={run_id} step=main action=start")
         create_directories()
         remove_files_in_dir(DOWNLOADS_PATH)
 
-        export_ids = submit_export_jobs(mc, 2017, 1, datetime.now().year, datetime.now().month)  
-        enqueue_jobs(mc, export_ids)
+        start_year = 2017
+        start_month = 1
+        end_year = datetime.now().year
+        end_month = datetime.now().month
+        log.info(f"[MKTO_DEDUPE] run_id={run_id} step=submit_export_jobs action=before start_year={start_year} "
+                 f"start_month={start_month} end_year={end_year} end_month={end_month}")
+        export_ids = submit_export_jobs(mc, start_year, start_month, end_year, end_month, run_id=run_id)
+        log.info(f"[MKTO_DEDUPE] run_id={run_id} step=submit_export_jobs action=after export_ids_count={len(export_ids)}")
+        log.info(f"[MKTO_DEDUPE] run_id={run_id} step=enqueue action=before total_jobs={len(export_ids)}")
+        enqueue_jobs(mc, export_ids, run_id=run_id)
         
-        if not monitor_queued_jobs(mc, export_ids):
+        if not monitor_queued_jobs(mc, export_ids, run_id=run_id):
             raise Exception("Error downloading data from Marketo")
         
-        download_jobs(mc, export_ids)
+        download_jobs(mc, export_ids, run_id=run_id)
         db_file_name = populate_sqlite_table(export_ids)
         category_types = get_contact_type_categories()
         dupes_from_dump = get_dupes_from_dump(db_file_name)[0:CONTACTS_LIMIT]
         perform_dedupe(db_file_name, category_types, dupes_from_dump)
 
     except Exception as e:
-        log.critical("Critical error has occurred. Error info: {e}".format(e=e))
+        log.critical(f"[MKTO_DEDUPE] run_id={run_id} step=main action=error exc_str={str(e)} exc_repr={repr(e)}")
         log.error(traceback.print_exc())
         send_teams_message(summary="Marketo_Dedupe", activityTitle="Critical error occurred",
                            activitySubtitle=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=e)

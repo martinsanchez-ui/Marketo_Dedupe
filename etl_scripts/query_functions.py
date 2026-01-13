@@ -6,7 +6,7 @@ query_functions.py    Mar/2025    Jose Rosati
 
 import sqlite3
 
-from global_settings import bi_db, log
+from global_settings import bi_db, log, mask_email
 
 
 def ensure_unique_record(contact_id, marketo_id):
@@ -29,7 +29,8 @@ def ensure_unique_record(contact_id, marketo_id):
     cursor.close()
     
     if number_of_records != 1:
-        log.error("Unable to determine an unique record with contact_id {contact_id} and marketo_id {marketo_id} in email_marketing_f")
+        log.error(f"[MKTO_DEDUPE] step=ensure_unique_record action=error contact_id={contact_id} "
+                  f"marketo_id={marketo_id} records_found={number_of_records}")
         return False
     
     return True
@@ -110,11 +111,15 @@ def get_records_from_email_marketing_f(contact_id, email):
             ) = '%s';
     """
 
+    log.debug(f"[MKTO_DEDUPE] step=get_records_from_email_marketing_f action=start contact_id={contact_id} "
+              f"email={mask_email(email)}")
     bi_db_cursor = bi_db.cursor()
     bi_db_cursor.execute(GET_RECORDS_EMAIL_MARKETING_F % (contact_id, email))
     records = bi_db_cursor.fetchall()
     bi_db_cursor.close()
 
+    log.debug(f"[MKTO_DEDUPE] step=get_records_from_email_marketing_f action=complete contact_id={contact_id} "
+              f"records_found={len(records)}")
     return records
 
 def is_deleted_contact(contact_id):
@@ -176,11 +181,11 @@ def get_dupes_from_dump(db_file_name):
         ORDER BY CAST(ContactID AS UNSIGNED) ASC;
     """
     
-    log.info(f"Obtaining list of contacts with duplicates...")
+    log.info(f"[MKTO_DEDUPE] step=get_dupes_from_dump action=start db_file={db_file_name}")
     sqlite_conn = sqlite3.connect(db_file_name)
     cursor = sqlite_conn.cursor()
     dupes = tuple(cursor.execute(GET_DUPES_QUERY).fetchall())
-    log.info(f"Number of contacts with duplicated entries in Marketo: {len(dupes)}")
+    log.info(f"[MKTO_DEDUPE] step=get_dupes_from_dump action=complete duplicates_count={len(dupes)}")
     sqlite_conn.close()
     return dupes
 
